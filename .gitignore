@@ -1,0 +1,13 @@
+# Các tệp tin báo cáo và dữ liệu đo nhiệt độ
+*.csv
+*.html
+*.png
+
+# Tệp thực thi được biên dịch tự động từ stress_tool.swift
+stress_tool
+
+# Tệp hệ thống macOS và bộ nhớ đệm Python
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
