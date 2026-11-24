@@ -53,17 +53,17 @@ python3 -m pip install matplotlib
 python3 imac_thermal.py list
 ```
 
-### 2. Chạy stress test kết hợp CPU + GPU + VRAM / Run combined CPU + GPU + VRAM stress test
+### 2. Chạy stress test CPU + GPU + VRAM, ghi log & xuất báo cáo tự động (1 lệnh duy nhất) / All-in-One Stress Test, Real-time Log & Auto Report
 
-Chạy trong 300 giây với 4096 MB VRAM và in nhiệt độ raw theo thời gian thực:
+Chạy stress test trong 300 giây với 4096 MB VRAM, đồng thời in nhiệt độ raw theo thời gian thực, ghi ra `stress_test.csv` và **tự động tạo & mở báo cáo biểu đồ PNG + HTML** ngay khi kết thúc:
 
-Run for 300 seconds with 4096 MB VRAM and print live raw temperatures:
+Run stress test for 300 seconds with 4096 MB VRAM, print live raw temperatures, log to `stress_test.csv`, and **automatically generate & open the PNG + HTML report** upon completion:
 
 ```bash
 python3 imac_thermal.py stress --duration 300 --vram-mb 4096
 ```
 
-*(Đặt `--duration 0` để chạy liên tục cho đến khi nhấn `Ctrl-C`. / Use `--duration 0` to run until `Ctrl-C`.)*
+*(Tùy chọn thêm pha nghỉ / làm nguội: `--idle 60 --cool 60`. Đặt `--duration 0` để chạy liên tục đến khi nhấn `Ctrl-C`, báo cáo vẫn được tự động tạo. / Optional `--idle 60 --cool 60` phases; use `--duration 0` to run until `Ctrl-C`, report is still generated automatically.)*
 
 ### 3. Ghi nhật ký nhiệt độ 3 pha / Log 3-phase thermal data to CSV
 

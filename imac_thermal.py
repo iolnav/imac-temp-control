@@ -345,50 +345,10 @@ def read_snapshot(smc, sensors):
     return vals, fan
 
 
-def cmd_stress(args):
-    """Chạy trực tiếp bài stress test kết hợp CPU + GPU + VRAM và hiển thị nhiệt độ raw theo thời gian thực."""
+def resolve_active_sensors(sensors_arg):
+    """Kiểm tra và trả về từ điển các cảm biến SMC đọc được giá trị hợp lệ."""
     smc = SMC()
-    sensors = parse_sensors(args.sensors)
-    active = {}
-    for name, key in sensors.items():
-        try:
-            v, _ = smc.read(key)
-            if v is not None and 1 < v < 130:
-                active[name] = key
-        except KeyError:
-            pass
-    if not active:
-        sys.exit("Không có cảm biến nào đọc được.")
-
-    cpu_threads = 0 if args.no_cpu_stress else (args.procs or os.cpu_count() or 4)
-    vram_mb = 0 if args.no_gpu_stress else args.vram_mb
-    print(
-        f"Bắt đầu stress test | CPU={cpu_threads} luồng | GPU/VRAM={vram_mb} MB | "
-        f"Thời lượng={'vô hạn (Ctrl-C để dừng)' if args.duration <= 0 else f'{args.duration}s'}\n"
-    )
-
-    native_proc, procs, stop = start_stress(cpu_threads, vram_mb)
-    t0 = time.time()
-    try:
-        while args.duration <= 0 or (time.time() - t0) < args.duration:
-            elapsed = time.time() - t0
-            vals, fan = read_snapshot(smc, active)
-            print(
-                f"{elapsed:6.0f}s  "
-                + "  ".join(f"{n}={v}" for n, v in zip(list(active) + ["quạt"], vals + [fan]))
-            )
-            time.sleep(args.interval)
-    except KeyboardInterrupt:
-        print("\nĐã dừng stress test (Ctrl-C).")
-    finally:
-        stop_stress(native_proc, procs, stop)
-    print("Hoàn tất stress test.")
-
-
-def cmd_log(args):
-    """Ghi nhật ký nhiệt độ theo các pha (idle, load, cool) ra tệp CSV."""
-    smc = SMC()
-    sensors = parse_sensors(args.sensors)
+    sensors = parse_sensors(sensors_arg)
     active = {}
     for name, key in sensors.items():
         try:
@@ -401,16 +361,22 @@ def cmd_log(args):
         print(f"[bỏ qua] {name} ({key}) không đọc được - hãy dùng lệnh `list` để tìm đúng khóa.")
     if not active:
         sys.exit("Không có cảm biến nào đọc được.")
+    return smc, active
 
-    phases = [(n, d) for n, d in (("idle", args.idle), ("load", args.load), ("cool", args.cool)) if d > 0]
+
+def run_session(args, phases, auto_report=False):
+    """Chạy phiên stress test kết hợp ghi log CSV theo thời gian thực và tự động xuất báo cáo nếu được bật."""
+    smc, active = resolve_active_sensors(args.sensors)
     cols = ["time_s", "phase"] + list(active) + ["fan_rpm"]
     cpu_threads = 0 if args.no_cpu_stress else (args.procs or os.cpu_count() or 4)
     vram_mb = 0 if args.no_gpu_stress else args.vram_mb
+
     print(f"Ghi vào {args.out}  |  cảm biến: {', '.join(f'{n}={k}' for n, k in active.items())}")
-    print(f"Pha 'load': tự động stress kết hợp CPU ({cpu_threads} luồng) + GPU/VRAM ({vram_mb} MB).\n")
+    print(f"Cấu hình tải ('load'): CPU={cpu_threads} luồng | GPU/VRAM={vram_mb} MB.\n")
 
     t0 = time.time()
     native_proc, procs, stop = None, [], None
+    row_count = 0
     try:
         with open(args.out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -418,12 +384,13 @@ def cmd_log(args):
             for pname, dur in phases:
                 if pname == "load":
                     native_proc, procs, stop = start_stress(cpu_threads, vram_mb)
-                end = time.time() + dur
-                while time.time() < end:
+                end = None if (pname == "load" and dur <= 0) else (time.time() + dur)
+                while end is None or time.time() < end:
                     vals, fan = read_snapshot(smc, active)
                     row = [round(time.time() - t0, 1), pname] + vals + [fan]
                     w.writerow(row)
                     f.flush()
+                    row_count += 1
                     print(
                         f"{row[0]:7.0f}s  {pname:<5} "
                         + "  ".join(f"{n}={v}" for n, v in zip(list(active) + ["quạt"], row[2:]))
@@ -436,7 +403,32 @@ def cmd_log(args):
         print("\nDừng sớm (Ctrl-C), dữ liệu đã được lưu lại.")
     finally:
         stop_stress(native_proc, procs, stop)
-    print(f"\nXong. Tạo báo cáo bằng lệnh:  python3 {os.path.basename(__file__)} report {args.out}")
+
+    if auto_report and row_count > 0:
+        report_base = getattr(args, "report_out", None) or os.path.splitext(args.out)[0]
+        print("\nĐang tạo báo cáo và biểu đồ trực quan...")
+        generate_report([args.out], out_base=report_base)
+    elif row_count > 0:
+        print(f"\nXong. Tạo báo cáo bằng lệnh:  python3 {os.path.basename(__file__)} report {args.out}")
+
+
+def cmd_stress(args):
+    """Chạy stress test CPU + GPU + VRAM, ghi log thời gian thực và tự động tạo báo cáo HTML/PNG."""
+    phases = []
+    if args.idle > 0:
+        phases.append(("idle", args.idle))
+    phases.append(("load", args.duration))
+    if args.cool > 0:
+        phases.append(("cool", args.cool))
+    run_session(args, phases, auto_report=not args.no_report)
+
+
+def cmd_log(args):
+    """Ghi nhật ký nhiệt độ theo các pha (idle, load, cool) ra tệp CSV."""
+    phases = [(n, d) for n, d in (("idle", args.idle), ("load", args.load), ("cool", args.cool)) if d > 0]
+    if not phases:
+        sys.exit("Ít nhất một pha (idle, load, cool) phải lớn hơn 0 giây.")
+    run_session(args, phases, auto_report=args.report)
 
 
 # ------------------------------------------------------------ báo cáo -----
@@ -474,7 +466,7 @@ def spans(t, phases):
     return out
 
 
-def cmd_report(args):
+def generate_report(files, out_base=None):
     """Vẽ biểu đồ PNG và xuất bảng thống kê HTML từ một hoặc nhiều tệp CSV."""
     try:
         import matplotlib
@@ -484,7 +476,7 @@ def cmd_report(args):
         sys.exit("Thiếu thư viện matplotlib. Cài đặt bằng lệnh:  python3 -m pip install matplotlib")
 
     sets = []
-    for p in args.files:
+    for p in files:
         d, cols = load_csv(p)
         sets.append((os.path.splitext(os.path.basename(p))[0], d, cols))
 
@@ -524,7 +516,7 @@ def cmd_report(args):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=130)
     png = buf.getvalue()
-    base = args.out or "bao_cao_nhiet_do"
+    base = out_base or "bao_cao_nhiet_do"
     with open(base + ".png", "wb") as f:
         f.write(png)
 
@@ -566,6 +558,11 @@ th{{background:#f2f2f2}}td:first-child,td:nth-child(2){{text-align:left}}img{{ma
     os.system(f'open "{base}.html"')
 
 
+def cmd_report(args):
+    """Điểm vào lệnh `report` từ dòng lệnh."""
+    generate_report(args.files, out_base=args.out)
+
+
 # -------------------------------------------------------------- main -----
 def main():
     """Điểm khởi chạy chương trình dòng lệnh."""
@@ -573,9 +570,17 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="liệt kê các khóa nhiệt độ SMC").set_defaults(fn=cmd_list)
 
-    st = sub.add_parser("stress", help="chạy stress test kết hợp CPU + GPU + VRAM và xem nhiệt độ trực tiếp")
+    st = sub.add_parser(
+        "stress",
+        help="chạy stress test CPU + GPU + VRAM, ghi log thời gian thực và tự động tạo báo cáo",
+    )
     st.add_argument("--duration", type=int, default=300, help="thời lượng stress test, giây (0 = chạy vô hạn, mặc định 300)")
-    st.add_argument("--interval", type=float, default=2.0, help="chu kỳ in nhiệt độ, tính bằng giây")
+    st.add_argument("--idle", type=int, default=0, help="tùy chọn thêm pha nghỉ trước khi stress, giây (mặc định 0)")
+    st.add_argument("--cool", type=int, default=0, help="tùy chọn thêm pha làm nguội sau khi stress, giây (mặc định 0)")
+    st.add_argument("--interval", type=float, default=2.0, help="chu kỳ lấy mẫu và in nhiệt độ, giây (mặc định 2.0)")
+    st.add_argument("--out", default="stress_test.csv", help="tên tệp CSV lưu nhật ký (mặc định stress_test.csv)")
+    st.add_argument("--report-out", help="tên tệp báo cáo HTML/PNG đầu ra (mặc định trùng tên với --out)")
+    st.add_argument("--no-report", action="store_true", help="không tự động tạo báo cáo sau khi stress xong")
     st.add_argument("--sensors", help='ghi đè khóa SMC, vd "GPU_VRAM_Raw=TG1p,GPU_Die_Raw=TG0d"')
     st.add_argument("--procs", type=int, help="số luồng ép tải CPU (mặc định = số luồng hệ thống)")
     st.add_argument("--vram-mb", type=int, default=4096, help="dung lượng VRAM ép tải, MB (mặc định 4096)")
@@ -589,6 +594,7 @@ def main():
     p.add_argument("--cool", type=int, default=300, help="số giây làm nguội (mặc định 300)")
     p.add_argument("--interval", type=float, default=2.0, help="chu kỳ lấy mẫu, tính bằng giây")
     p.add_argument("--out", default="nhiet_do.csv", help="tên tệp CSV đầu ra")
+    p.add_argument("--report", action="store_true", help="tự động tạo báo cáo HTML + biểu đồ sau khi ghi xong")
     p.add_argument("--sensors", help='ghi đè khóa SMC, vd "GPU_VRAM_Raw=TG1p,GPU_Die_Raw=TG0d"')
     p.add_argument("--procs", type=int, help="số luồng ép tải CPU (mặc định = số luồng hệ thống)")
     p.add_argument("--vram-mb", type=int, default=4096, help="dung lượng VRAM ép tải trong pha load, MB (mặc định 4096)")
