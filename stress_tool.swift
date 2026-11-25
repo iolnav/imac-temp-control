@@ -3,6 +3,7 @@
 
 import Foundation
 import Metal
+import os
 
 /// Tham số dòng lệnh của chương trình.
 struct Config {
@@ -40,11 +41,25 @@ func parseArgs() -> Config {
     return cfg
 }
 
-// Cờ dừng an toàn khi nhận tín hiệu ngắt từ hệ thống hoặc Ctrl-C.
-private var shouldStop: sig_atomic_t = 0
+// Cờ dừng an toàn luồng (dùng os_unfair_lock để trình biên dịch -O không tối ưu hóa bỏ qua kiểm tra).
+private var stopLock = os_unfair_lock()
+private var _shouldStop = false
+
+func isStopped() -> Bool {
+    os_unfair_lock_lock(&stopLock)
+    let v = _shouldStop
+    os_unfair_lock_unlock(&stopLock)
+    return v
+}
+
+func requestStop() {
+    os_unfair_lock_lock(&stopLock)
+    _shouldStop = true
+    os_unfair_lock_unlock(&stopLock)
+}
 
 func handleSignal(_ sig: Int32) {
-    shouldStop = 1
+    _exit(0)
 }
 
 /// Khởi chạy các luồng ép tải CPU bằng phép toán dấu phẩy động nặng (FMA, lượng giác, căn bậc hai).
@@ -52,12 +67,13 @@ func startCPUStress(threads: Int, group: DispatchGroup) {
     guard threads > 0 else { return }
     for t in 0..<threads {
         group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
+        // Dùng QoS .utility để vẫn ép 100% CPU nhưng không làm nghẽn luồng điều phối GPU/Metal và tiến trình ghi log
+        DispatchQueue.global(qos: .utility).async {
             var a = 1.000001 + Double(t) * 0.0001
             var b = 0.999999 - Double(t) * 0.0001
             var c = 1.234567
             var sink: Double = 0
-            while shouldStop == 0 {
+            while !isStopped() {
                 // Vòng lặp tính toán liên tục để giữ ALU và FPU của CPU ở mức tải tối đa
                 for _ in 0..<50_000 {
                     a = a.addingProduct(b, c)
@@ -96,7 +112,7 @@ kernel void burn_gpu_vram(device const float4 *srcA [[buffer(0)]],
                           uint id [[thread_position_in_grid]]) {
     float4 x = srcA[id];
     float4 y = srcB[id];
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 128; i++) {
         x = fma(x, y, float4(1.00013f, 0.99987f, 1.00029f, 0.99971f));
         y = fma(y, x, float4(0.99979f, 1.00021f, 0.99963f, 1.00037f));
         // Giữ giá trị trong khoảng ổn định để tránh NaN/Inf
@@ -110,7 +126,9 @@ kernel void burn_gpu_vram(device const float4 *srcA [[buffer(0)]],
 /// Khởi chạy stress test GPU và VRAM qua Metal.
 func startGPUVRAMStress(vramMB: Int, group: DispatchGroup) {
     guard vramMB > 0 else { return }
-    guard let device = MTLCreateSystemDefaultDevice(),
+    // Ưu tiên chọn GPU rời (isLowPower == false, vd Radeon Pro 580) thay vì iGPU
+    let selectedDevice = MTLCopyAllDevices().first(where: { !$0.isLowPower }) ?? MTLCreateSystemDefaultDevice()
+    guard let device = selectedDevice,
           let queue = device.makeCommandQueue() else {
         fputs("[cảnh báo] Không khởi tạo được thiết bị Metal để stress GPU.\n", stderr)
         return
@@ -169,14 +187,15 @@ func startGPUVRAMStress(vramMB: Int, group: DispatchGroup) {
     fflush(stdout)
 
     group.enter()
-    DispatchQueue.global(qos: .userInitiated).async {
+    // Chạy trên QoS .userInteractive để luồng gửi lệnh Metal luôn được đánh thức ngay lập tức, không bị CPU burn chèn ép
+    DispatchQueue.global(qos: .userInteractive).async {
         var step = 0
         let n = buffers.count
-        while shouldStop == 0 {
+        while !isStopped() {
             // Đẩy 2 lệnh nối tiếp (double-buffering) để GPU luôn bận liên tục không bị rảnh giữa các lần chờ
             var lastCmd: MTLCommandBuffer?
             for _ in 0..<2 {
-                if shouldStop != 0 { break }
+                if isStopped() { break }
                 let a = buffers[step % n]
                 let b = buffers[(step + 1) % n]
                 let c = buffers[(step + 2) % n]
@@ -219,12 +238,12 @@ if cfg.vramMB > 0 {
 
 if cfg.durationSec > 0 {
     let deadline = Date().addingTimeInterval(cfg.durationSec)
-    while shouldStop == 0 && Date() < deadline {
+    while !isStopped() && Date() < deadline {
         Thread.sleep(forTimeInterval: 0.2)
     }
-    shouldStop = 1
+    requestStop()
 } else {
-    while shouldStop == 0 {
+    while !isStopped() {
         Thread.sleep(forTimeInterval: 0.2)
     }
 }
