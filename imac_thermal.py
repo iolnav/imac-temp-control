@@ -439,6 +439,7 @@ def load_csv(path):
     cols = [c for c in rows[0].keys() if c not in ("time_s", "phase", "fan_rpm")]
     data = {
         "t": [float(r["time_s"]) / 60 for r in rows],
+        "t_s": [float(r["time_s"]) for r in rows],
         "phase": [r["phase"] for r in rows],
         "fan": [float(r["fan_rpm"]) if r["fan_rpm"] else None for r in rows],
     }
@@ -454,6 +455,40 @@ def stats(vals, phases, ph):
         return None
     tail = v[max(0, int(len(v) * 0.8)):]
     return min(v), sum(v) / len(v), max(v), sum(tail) / len(tail)
+
+
+def thermal_rates(t_s, vals, phases):
+    """Tính thời gian và tốc độ tăng nhiệt (idle -> load) và hạ nhiệt (load -> cool) cho một cảm biến."""
+    by_phase = {"idle": [], "load": [], "cool": []}
+    for ts, v, ph in zip(t_s, vals, phases):
+        if ph in by_phase and v is not None:
+            by_phase[ph].append((ts, v))
+
+    heat = None
+    if by_phase["idle"] and by_phase["load"]:
+        t_idle_avg = sum(v for _, v in by_phase["idle"]) / len(by_phase["idle"])
+        t_load_start = by_phase["load"][0][0]
+        t_load_max = max(v for _, v in by_phase["load"])
+        t_at_max = next(ts for ts, v in by_phase["load"] if v >= t_load_max)
+        dt_up = max(0.0, t_at_max - t_load_start)
+        delta_up = t_load_max - t_idle_avg
+        rate_up = (delta_up / dt_up) if dt_up > 0 else None
+        heat = (t_idle_avg, t_load_max, delta_up, dt_up, rate_up)
+
+    cool = None
+    if by_phase["load"] and by_phase["cool"]:
+        load_vals = [v for _, v in by_phase["load"]]
+        tail = load_vals[max(0, int(len(load_vals) * 0.8)):]
+        t_load_high = sum(tail) / len(tail)
+        t_cool_start = by_phase["cool"][0][0]
+        t_cool_min = min(v for _, v in by_phase["cool"])
+        t_at_min = next(ts for ts, v in by_phase["cool"] if v <= t_cool_min)
+        dt_down = max(0.0, t_at_min - t_cool_start)
+        delta_down = t_load_high - t_cool_min
+        rate_down = (delta_down / dt_down) if dt_down > 0 else None
+        cool = (t_load_high, t_cool_min, delta_down, dt_down, rate_down)
+
+    return heat, cool
 
 
 def spans(t, phases):
@@ -542,6 +577,33 @@ def generate_report(files, out_base=None):
         if fans:
             lines.append(f"Quạt: TB {sum(fans) / len(fans):.0f} RPM, tối đa {max(fans):.0f} RPM")
         html.append("</table>")
+
+        # Bảng tốc độ tăng nhiệt (idle -> load) và hạ nhiệt (load -> cool)
+        rate_rows = [(c, *thermal_rates(d["t_s"], d[c], d["phase"])) for c in cols]
+        if any(h is not None or cl is not None for _, h, cl in rate_rows):
+            lines.append("\nTốc độ tăng nhiệt (idle TB -> load Max) & hạ nhiệt (load ổn định -> cool Min):")
+            lines.append(
+                f"{'Cảm biến':<14}{'Tăng nhiệt':<28}{'TG tăng':>10}{'Hạ nhiệt':<28}{'TG hạ':>10}"
+            )
+            html.append(
+                "<h3>Tốc độ tăng nhiệt (idle → load) &amp; hạ nhiệt (load → cool)</h3>"
+                "<table><tr><th>Cảm biến</th><th>Tăng nhiệt (idle TB → load Max)</th>"
+                "<th>Thời gian / Tốc độ tăng</th><th>Hạ nhiệt (load cuối → cool Min)</th>"
+                "<th>Thời gian / Tốc độ hạ</th></tr>"
+            )
+            for c, h, cl in rate_rows:
+                if h is None and cl is None:
+                    continue
+                h_txt = f"{h[0]:.1f} -> {h[1]:.1f}°C (+{h[2]:.1f})" if h else "-"
+                h_tm = f"{h[3]:.1f}s" + (f" ({h[4]:.2f}°C/s)" if h[4] is not None else "") if h else "-"
+                c_txt = f"{cl[0]:.1f} -> {cl[1]:.1f}°C (-{cl[2]:.1f})" if cl else "-"
+                c_tm = f"{cl[3]:.1f}s" + (f" ({cl[4]:.2f}°C/s)" if cl[4] is not None else "") if cl else "-"
+                lines.append(f"{c:<14}{h_txt:<28}{h_tm:>10}  {c_txt:<28}{c_tm:>10}")
+                html.append(
+                    f"<tr><td>{c}</td><td>{h_txt}</td><td>{h_tm}</td>"
+                    f"<td>{c_txt}</td><td>{c_tm}</td></tr>"
+                )
+            html.append("</table>")
     print("\n".join(lines))
 
     page = (
